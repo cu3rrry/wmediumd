@@ -133,7 +133,20 @@ typedef uint64_t u64;
 
 #define NOISE_LEVEL	(-91)
 #define CCA_THRESHOLD	(-90)
-#define ENABLE_MEDIUM_DETECTION	true
+/*
+ * 默认关闭自动 medium 划分。
+ * 对单 AP 饱和吞吐场景，动态 medium 切换会把碰撞域变成
+ * 历史相关状态，导致结果波动明显、且偏离 Bianchi 假设。
+ */
+#define ENABLE_MEDIUM_DETECTION	false
+#define RX_WINDOW_SLOT_US	(4)
+/*
+ * 4096 * 4us 只有 16.384ms。高节点饱和场景下，单站队列尾部很容易
+ * 排到这个窗口之外，提前预约的未来 PPDU 会覆盖仍未送达的近未来 slot，
+ * 使 SINR 估计被“未来帧”污染。把窗口扩大到 262.144ms，可覆盖
+ * 70-100 节点下观察到的排队深度。
+ */
+#define RX_WINDOW_SLOTS		(65536)
 
 enum En_OperationMode
 {
@@ -145,6 +158,20 @@ struct wqueue {
 	struct list_head frames;
 	int cw_min;
 	int cw_max;
+};
+
+/*
+ * 每个接收端维护一个 4us 的循环窗口，用于累计未来时刻的
+ * 接收功率。slot_idx 采用绝对时间编号，避免频繁清空窗口。
+ */
+struct rx_slot {
+	u64 slot_idx;
+	double power_mw;
+};
+
+struct rx_window {
+	struct rx_slot *slots;
+	size_t num_slots;
 };
 
 struct station {
@@ -160,6 +187,7 @@ struct station {
 	int isap; 		/* verify whether the node is ap */
 	double freq;			/* frequency [Mhz] */
 	struct wqueue queues[IEEE80211_NUM_ACS];
+	struct rx_window rx_window;
 	struct list_head list;
     int medium_id;
 };
@@ -191,6 +219,7 @@ struct wmediumd {
 
 	struct nl_cb *cb;
 	int family_id;
+	u32 delivery_seq;
 
 	int (*get_link_snr)(struct wmediumd *, struct station *,
 			    struct station *);
@@ -217,9 +246,21 @@ struct frame {
 	u32 freq;
 	int flags;
 	int signal;
-	int duration;
+	int service_time_us;
+	int ppdu_airtime_us;
+	int final_rate_idx;
 	int tx_rates_count;
+	int queue_ac;
+	int current_rate_pos;
+	int current_cw;
+	int ack_exchange_us;
+	bool noack;
+	bool attempt_scheduled;
+	double fixed_choice;
+	struct timespec ppdu_start;
+	struct timespec ppdu_end;
 	struct station *sender;
+	unsigned char attempts_done[IEEE80211_TX_MAX_RATES];
 	struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
 	size_t data_len;
 	u8 data[0];			/* frame contents */
@@ -260,8 +301,12 @@ struct intf_info {
 };
 
 void station_init_queues(struct station *station);
+void station_free_resources(struct station *station);
 double get_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq,
-			       int frame_len);
+				       int frame_len);
+double get_bit_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq);
+double get_error_prob_from_ber(double ber, unsigned int rate_idx, u32 freq,
+				       int frame_len);
 bool timespec_before(struct timespec *t1, struct timespec *t2);
 int set_default_per(struct wmediumd *ctx);
 int read_per_file(struct wmediumd *ctx, const char *file_name);
