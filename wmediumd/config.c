@@ -792,12 +792,14 @@ int load_config(struct wmediumd *ctx, const char *file, const char *per_file, bo
             }
         }
     }
-    medium_detection = config_lookup(cf, "ifaces.enable_medium_detection");
-    if (medium_detection) {
-        ctx->enable_medium_detection =config_setting_get_bool(enable_interference);
-    }else{
-        ctx->enable_medium_detection = ENABLE_MEDIUM_DETECTION;
-    }
+	    medium_detection = config_lookup(cf, "ifaces.enable_medium_detection");
+	    if (medium_detection) {
+	        /* 修正配置读取对象，避免中等检测开关被干扰开关误覆盖。 */
+	        ctx->enable_medium_detection =
+			config_setting_get_bool(medium_detection);
+	    }else{
+	        ctx->enable_medium_detection = ENABLE_MEDIUM_DETECTION;
+	    }
 
 	if (per_file && error_probs) {
 		w_flogf(ctx, LOG_ERR, stderr,
