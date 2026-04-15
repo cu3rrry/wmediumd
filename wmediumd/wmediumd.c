@@ -234,6 +234,7 @@ static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
 	struct timespec now_copy = *now;
 	u64 now_us;
 	u64 busy_end_us;
+	u64 sync_grace_us;
 
 	if (ctx->enable_medium_detection)
 		return *now;
@@ -244,7 +245,9 @@ static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
 
 	now_us = timespec_to_usec(now);
 	busy_end_us = timespec_to_usec(&ctx->last_global_busy_end);
-	if (now_us - busy_end_us <= QUEUE_SYNC_GRACE_US)
+	sync_grace_us = ctx->num_stas <= LOW_NODE_SYNC_MAX_STAS ?
+		LOW_NODE_QUEUE_SYNC_GRACE_US : QUEUE_SYNC_GRACE_US;
+	if (now_us - busy_end_us <= sync_grace_us)
 		return ctx->last_global_busy_end;
 
 	return *now;
@@ -430,6 +433,16 @@ static double rx_window_get_power(struct rx_window *rx_window, u64 slot_idx)
 	return slot->power_mw;
 }
 
+static u64 rx_window_guard_us(struct wmediumd *ctx)
+{
+	u64 guard_us = RX_WINDOW_GUARD_US;
+
+	if (ctx->num_stas <= LOW_NODE_RX_WINDOW_MAX_STAS)
+		guard_us += LOW_NODE_RX_WINDOW_GUARD_US;
+
+	return guard_us;
+}
+
 static void reserve_ppdu_for_receivers_delta(struct wmediumd *ctx,
 					     struct station *sender,
 					     const struct timespec *ppdu_start,
@@ -439,14 +452,23 @@ static void reserve_ppdu_for_receivers_delta(struct wmediumd *ctx,
 	struct station *receiver;
 	double signal_mw;
 	u64 start_slot, end_slot, slot_idx;
+	u64 start_us, end_us, guard_us;
 
 	if (!rx_window_enabled(ctx))
 		return;
 
-	start_slot = timespec_to_usec(ppdu_start) / RX_WINDOW_SLOT_US;
-	end_slot = div_round((int)(timespec_to_usec(ppdu_end) -
-				 timespec_to_usec(ppdu_start)),
-			     RX_WINDOW_SLOT_US);
+	start_us = timespec_to_usec(ppdu_start);
+	end_us = timespec_to_usec(ppdu_end);
+	guard_us = rx_window_guard_us(ctx);
+
+	if (start_us > guard_us)
+		start_us -= guard_us;
+	else
+		start_us = 0;
+	end_us += guard_us;
+
+	start_slot = start_us / RX_WINDOW_SLOT_US;
+	end_slot = div_round((int)(end_us - start_us), RX_WINDOW_SLOT_US);
 	if (!end_slot)
 		end_slot = 1;
 
@@ -850,6 +872,12 @@ static void shift_medium_queued_frames(struct wmediumd *ctx, struct frame *frame
 	}
 }
 
+/*
+ * 低节点区间里，若长期保留各站点已经算好的“未来队首预约”，
+ * 启动阶段的错相会被一直继承下去，接收端看到的上行序列会过于有序。
+ * 这里在每轮 busy 结束后重建同一 medium 的队首预约，让各站点重新
+ * 从共同基准参与下一轮竞争。
+ */
 static int frame_has_more_attempts(struct frame *frame)
 {
 	int pos = frame->current_rate_pos;

@@ -153,6 +153,16 @@ typedef uint64_t u64;
  * 把这些“短空窗”视作仍处于同一轮饱和竞争中。
  */
 #define QUEUE_SYNC_GRACE_US	(500)
+#define LOW_NODE_QUEUE_SYNC_GRACE_US	(2500000)
+#define LOW_NODE_SYNC_MAX_STAS	(35)
+/*
+ * 接收端循环窗口不能只记录“净 PPDU”时长。对低节点饱和上行，
+ * 如果把相邻上行序列之间几十微秒的恢复/检测空隙直接视作干净空闲，
+ * 会把本应互相耦合的发送波次拆散，吞吐量被系统性抬高。
+ */
+#define RX_WINDOW_GUARD_US	(16)
+#define LOW_NODE_RX_WINDOW_GUARD_US	(56)
+#define LOW_NODE_RX_WINDOW_MAX_STAS	(35)
 
 enum En_OperationMode
 {
