@@ -154,15 +154,17 @@ typedef uint64_t u64;
  */
 #define QUEUE_SYNC_GRACE_US	(500)
 #define LOW_NODE_QUEUE_SYNC_GRACE_US	(2500000)
-#define LOW_NODE_SYNC_MAX_STAS	(35)
+#define LOW_NODE_SYNC_MAX_STAS	(30)
 /*
  * 接收端循环窗口不能只记录“净 PPDU”时长。对低节点饱和上行，
  * 如果把相邻上行序列之间几十微秒的恢复/检测空隙直接视作干净空闲，
  * 会把本应互相耦合的发送波次拆散，吞吐量被系统性抬高。
  */
-#define RX_WINDOW_GUARD_US	(16)
-#define LOW_NODE_RX_WINDOW_GUARD_US	(56)
-#define LOW_NODE_RX_WINDOW_MAX_STAS	(35)
+#define RX_WINDOW_GUARD_HIGH_US	(20)
+#define RX_WINDOW_GUARD_LOW_US	(96)
+#define RX_WINDOW_GUARD_MID_US	(160)
+#define LOW_NODE_RX_WINDOW_MAX_STAS	(12)
+#define MID_NODE_RX_WINDOW_MAX_STAS	(30)
 
 enum En_OperationMode
 {

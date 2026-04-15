@@ -435,12 +435,12 @@ static double rx_window_get_power(struct rx_window *rx_window, u64 slot_idx)
 
 static u64 rx_window_guard_us(struct wmediumd *ctx)
 {
-	u64 guard_us = RX_WINDOW_GUARD_US;
-
 	if (ctx->num_stas <= LOW_NODE_RX_WINDOW_MAX_STAS)
-		guard_us += LOW_NODE_RX_WINDOW_GUARD_US;
+		return RX_WINDOW_GUARD_LOW_US;
+	if (ctx->num_stas <= MID_NODE_RX_WINDOW_MAX_STAS)
+		return RX_WINDOW_GUARD_MID_US;
 
-	return guard_us;
+	return RX_WINDOW_GUARD_HIGH_US;
 }
 
 static void reserve_ppdu_for_receivers_delta(struct wmediumd *ctx,
