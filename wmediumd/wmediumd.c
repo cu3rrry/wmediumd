@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "wmediumd.h"
 #include "ieee80211.h"
@@ -88,12 +89,35 @@ static void wqueue_init(struct wqueue *wqueue, int cw_min, int cw_max)
 	wqueue->cw_max = cw_max;
 }
 
+static void rx_window_init(struct rx_window *rx_window)
+{
+	size_t i;
+
+	rx_window->num_slots = RX_WINDOW_SLOTS;
+	rx_window->slots = calloc(rx_window->num_slots, sizeof(*rx_window->slots));
+	if (!rx_window->slots) {
+		rx_window->num_slots = 0;
+		return;
+	}
+
+	for (i = 0; i < rx_window->num_slots; i++)
+		rx_window->slots[i].slot_idx = ULLONG_MAX;
+}
+
 void station_init_queues(struct station *station)
 {
 	wqueue_init(&station->queues[IEEE80211_AC_BK], 15, 1023);
 	wqueue_init(&station->queues[IEEE80211_AC_BE], 15, 1023);
 	wqueue_init(&station->queues[IEEE80211_AC_VI], 7, 15);
 	wqueue_init(&station->queues[IEEE80211_AC_VO], 3, 7);
+	rx_window_init(&station->rx_window);
+}
+
+void station_free_resources(struct station *station)
+{
+	free(station->rx_window.slots);
+	station->rx_window.slots = NULL;
+	station->rx_window.num_slots = 0;
 }
 
 bool timespec_before(struct timespec *t1, struct timespec *t2)
@@ -125,6 +149,128 @@ static int timespec_sub(struct timespec *a, struct timespec *b,
 	}
 
 	return 0;
+}
+
+static u64 timespec_to_usec(const struct timespec *t)
+{
+	return (u64)t->tv_sec * 1000000ULL + (u64)t->tv_nsec / 1000ULL;
+}
+
+static void timespec_add_usec64(struct timespec *t, u64 usec)
+{
+	t->tv_sec += usec / 1000000ULL;
+	t->tv_nsec += (long)((usec % 1000000ULL) * 1000ULL);
+	if (t->tv_nsec >= 1000000000L) {
+		t->tv_sec += t->tv_nsec / 1000000000L;
+		t->tv_nsec %= 1000000000L;
+	}
+}
+
+static struct timespec timespec_plus_usec(const struct timespec *base, u64 usec)
+{
+	struct timespec out = *base;
+
+	timespec_add_usec64(&out, usec);
+	return out;
+}
+
+static struct timespec timespec_from_usec(u64 usec)
+{
+	struct timespec out;
+
+	out.tv_sec = usec / 1000000ULL;
+	out.tv_nsec = (long)((usec % 1000000ULL) * 1000ULL);
+	return out;
+}
+
+static struct timespec timespec_forever(void)
+{
+	struct timespec out;
+
+	out.tv_sec = LONG_MAX / 4;
+	out.tv_nsec = 0;
+	return out;
+}
+
+static inline bool rx_window_enabled(struct wmediumd *ctx)
+{
+	return ctx->intf != NULL;
+}
+
+static inline bool same_medium(struct station *a, struct station *b)
+{
+	return a->medium_id == b->medium_id;
+}
+
+struct medium_interval {
+	struct timespec start;
+	struct timespec end;
+};
+
+static bool is_multicast_ether_addr(const u8 *addr);
+static struct station *get_station_by_addr(struct wmediumd *ctx, u8 *addr);
+static void schedule_frame_attempt(struct wmediumd *ctx, struct station *station,
+				   struct frame *frame,
+				   const struct timespec *base_time);
+
+static void clear_frame_schedule(struct frame *frame)
+{
+	struct timespec forever = timespec_forever();
+
+	frame->attempt_scheduled = false;
+	frame->ppdu_start = forever;
+	frame->ppdu_end = forever;
+	frame->expires = forever;
+}
+
+static struct frame *queue_head_frame(struct wqueue *queue)
+{
+	return list_first_entry_or_null(&queue->frames, struct frame, list);
+}
+
+static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
+					     const struct timespec *now)
+{
+	struct timespec now_copy = *now;
+	u64 now_us;
+	u64 busy_end_us;
+
+	if (ctx->enable_medium_detection)
+		return *now;
+	if (!ctx->last_global_busy_end.tv_sec && !ctx->last_global_busy_end.tv_nsec)
+		return *now;
+	if (timespec_before(&now_copy, &ctx->last_global_busy_end))
+		return ctx->last_global_busy_end;
+
+	now_us = timespec_to_usec(now);
+	busy_end_us = timespec_to_usec(&ctx->last_global_busy_end);
+	if (now_us - busy_end_us <= QUEUE_SYNC_GRACE_US)
+		return ctx->last_global_busy_end;
+
+	return *now;
+}
+
+static void schedule_queue_head_frame(struct wmediumd *ctx,
+				      struct station *station, int ac,
+				      const struct timespec *base_time)
+{
+	struct frame *frame = queue_head_frame(&station->queues[ac]);
+	struct timespec target = *base_time;
+	int i;
+
+	if (!frame || frame->attempt_scheduled)
+		return;
+
+	for (i = 0; i <= ac; i++) {
+		struct frame *head = queue_head_frame(&station->queues[i]);
+
+		if (!head || head == frame || !head->attempt_scheduled)
+			continue;
+		if (timespec_before(&target, &head->expires))
+			target = head->expires;
+	}
+
+	schedule_frame_attempt(ctx, station, frame, &target);
 }
 
 void rearm_timer(struct wmediumd *ctx)
@@ -239,8 +385,556 @@ static double milliwatt_to_dBm(double value)
 	return 10.0 * log10(value);
 }
 
-static int set_interference_duration(struct wmediumd *ctx, int src_idx,
-				     int duration, int signal)
+static int get_signal_dbm(struct wmediumd *ctx, struct station *src,
+			  struct station *dst, bool include_fading)
+{
+	int snr;
+
+	snr = ctx->get_link_snr(ctx, src, dst);
+	if (include_fading)
+		snr += ctx->get_fading_signal(ctx);
+
+	return snr + NOISE_LEVEL;
+}
+
+static void rx_window_add_power(struct rx_window *rx_window, u64 slot_idx,
+				double power_mw)
+{
+	struct rx_slot *slot;
+
+	if (!rx_window->slots || !rx_window->num_slots)
+		return;
+
+	slot = &rx_window->slots[slot_idx % rx_window->num_slots];
+	if (slot->slot_idx != slot_idx) {
+		slot->slot_idx = slot_idx;
+		slot->power_mw = 0.0;
+	}
+
+	slot->power_mw += power_mw;
+	if (slot->power_mw < 0.0)
+		slot->power_mw = 0.0;
+}
+
+static double rx_window_get_power(struct rx_window *rx_window, u64 slot_idx)
+{
+	struct rx_slot *slot;
+
+	if (!rx_window->slots || !rx_window->num_slots)
+		return 0.0;
+
+	slot = &rx_window->slots[slot_idx % rx_window->num_slots];
+	if (slot->slot_idx != slot_idx)
+		return 0.0;
+
+	return slot->power_mw;
+}
+
+static void reserve_ppdu_for_receivers_delta(struct wmediumd *ctx,
+					     struct station *sender,
+					     const struct timespec *ppdu_start,
+					     const struct timespec *ppdu_end,
+					     double delta)
+{
+	struct station *receiver;
+	double signal_mw;
+	u64 start_slot, end_slot, slot_idx;
+
+	if (!rx_window_enabled(ctx))
+		return;
+
+	start_slot = timespec_to_usec(ppdu_start) / RX_WINDOW_SLOT_US;
+	end_slot = div_round((int)(timespec_to_usec(ppdu_end) -
+				 timespec_to_usec(ppdu_start)),
+			     RX_WINDOW_SLOT_US);
+	if (!end_slot)
+		end_slot = 1;
+
+	list_for_each_entry(receiver, &ctx->stations, list) {
+		int signal_dbm;
+
+		if (receiver == sender || !same_medium(sender, receiver))
+			continue;
+
+		signal_dbm = get_signal_dbm(ctx, sender, receiver, false);
+		signal_mw = dBm_to_milliwatt(signal_dbm) * delta;
+
+		for (slot_idx = 0; slot_idx < end_slot; slot_idx++)
+			rx_window_add_power(&receiver->rx_window,
+					    start_slot + slot_idx, signal_mw);
+	}
+}
+
+static void reserve_ppdu_for_receivers(struct wmediumd *ctx, struct station *sender,
+				       const struct timespec *ppdu_start,
+				       const struct timespec *ppdu_end)
+{
+	reserve_ppdu_for_receivers_delta(ctx, sender, ppdu_start, ppdu_end, 1.0);
+}
+
+static void release_ppdu_for_receivers(struct wmediumd *ctx, struct station *sender,
+				       const struct timespec *ppdu_start,
+				       const struct timespec *ppdu_end)
+{
+	reserve_ppdu_for_receivers_delta(ctx, sender, ppdu_start, ppdu_end, -1.0);
+}
+
+static void configure_best_effort_socket(int sock)
+{
+	int enable = 1;
+	int buf_size = 1 << 20;
+
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+	setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+	setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+}
+
+static ssize_t sendto_retry(int sock, const void *buf, size_t len, int flags,
+			    const struct sockaddr *dest_addr,
+			    socklen_t addrlen)
+{
+	ssize_t ret;
+
+	do {
+		ret = sendto(sock, buf, len, flags, dest_addr, addrlen);
+	} while (ret < 0 && errno == EINTR);
+
+	return ret;
+}
+
+static ssize_t recvfrom_retry(int sock, void *buf, size_t len, int flags,
+			      struct sockaddr *src_addr, socklen_t *addrlen)
+{
+	ssize_t ret;
+
+	do {
+		ret = recvfrom(sock, buf, len, flags, src_addr, addrlen);
+	} while (ret < 0 && errno == EINTR);
+
+	if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		return 0;
+
+	return ret;
+}
+
+/*
+ * 依据接收端 4us 窗口中的累计功率，逐符号估算等效 BER。
+ * exclude_self=true 时，会从窗口累计值中扣除当前目标帧自身功率。
+ */
+static double calc_avg_ber_from_window(struct station *receiver,
+				       const struct timespec *ppdu_start,
+				       const struct timespec *ppdu_end,
+				       double signal_mw, bool exclude_self,
+				       unsigned int rate_idx, u32 freq)
+{
+	u64 start_slot, slot_count, slot_idx;
+	double ber_sum = 0.0;
+
+	if (signal_mw <= 1.0)
+		return 1.0;
+
+	start_slot = timespec_to_usec(ppdu_start) / RX_WINDOW_SLOT_US;
+	slot_count = div_round((int)(timespec_to_usec(ppdu_end) -
+				 timespec_to_usec(ppdu_start)),
+			      RX_WINDOW_SLOT_US);
+	if (!slot_count)
+		slot_count = 1;
+
+	for (slot_idx = 0; slot_idx < slot_count; slot_idx++) {
+		double total_power;
+		double intf_power;
+		double sinr_linear;
+		double sinr_db;
+
+		total_power = rx_window_get_power(&receiver->rx_window,
+						  start_slot + slot_idx);
+		if (exclude_self) {
+			total_power -= signal_mw;
+			if (total_power < 0.0)
+				total_power = 0.0;
+		}
+
+		intf_power = 1.0 + total_power;
+		sinr_linear = signal_mw / intf_power;
+		sinr_db = milliwatt_to_dBm(sinr_linear);
+		ber_sum += get_bit_error_prob_from_snr(sinr_db, rate_idx, freq);
+	}
+
+	return ber_sum / slot_count;
+}
+
+static double calc_rx_error_prob(struct wmediumd *ctx, struct station *sender,
+				 struct station *receiver,
+				 const struct timespec *ppdu_start,
+				 const struct timespec *ppdu_end,
+				 int signal_dbm, unsigned int rate_idx,
+				 u32 freq, int frame_len, bool exclude_self)
+{
+	double signal_mw;
+	double avg_ber;
+
+	if (!receiver)
+		return 0.0;
+
+	signal_mw = dBm_to_milliwatt(signal_dbm);
+	if (signal_mw <= 1.0)
+		return 1.0;
+
+	if (!rx_window_enabled(ctx) || !receiver->rx_window.slots)
+		return ctx->get_error_prob(ctx, milliwatt_to_dBm(signal_mw), rate_idx,
+					   freq, frame_len, sender, receiver);
+
+	avg_ber = calc_avg_ber_from_window(receiver, ppdu_start, ppdu_end,
+					   signal_mw, exclude_self,
+					   rate_idx, freq);
+	return get_error_prob_from_ber(avg_ber, rate_idx, freq, frame_len);
+}
+
+static int medium_interval_cmp(const void *lhs, const void *rhs)
+{
+	const struct medium_interval *a = lhs;
+	const struct medium_interval *b = rhs;
+	u64 a_start = timespec_to_usec(&a->start);
+	u64 b_start = timespec_to_usec(&b->start);
+	u64 a_end = timespec_to_usec(&a->end);
+	u64 b_end = timespec_to_usec(&b->end);
+
+	if (a_start < b_start)
+		return -1;
+	if (a_start > b_start)
+		return 1;
+	if (a_end < b_end)
+		return -1;
+	if (a_end > b_end)
+		return 1;
+	return 0;
+}
+
+static size_t collect_medium_intervals(struct wmediumd *ctx, struct station *station,
+				       struct frame *skip,
+				       const struct timespec *base_time,
+				       struct medium_interval **out)
+{
+	struct station *peer;
+	u64 base_us = timespec_to_usec(base_time);
+	size_t count = 0;
+	size_t idx = 0;
+	int ac;
+
+	*out = NULL;
+
+	list_for_each_entry(peer, &ctx->stations, list) {
+		if (!same_medium(station, peer))
+			continue;
+
+		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+			struct frame *queued;
+
+			list_for_each_entry(queued, &peer->queues[ac].frames, list) {
+				if (queued == skip)
+					continue;
+				if (!queued->attempt_scheduled)
+					continue;
+				if (timespec_to_usec(&queued->ppdu_end) <= base_us)
+					continue;
+				count++;
+			}
+		}
+	}
+
+	if (!count)
+		return 0;
+
+	*out = calloc(count, sizeof(**out));
+	if (!*out)
+		return 0;
+
+	list_for_each_entry(peer, &ctx->stations, list) {
+		if (!same_medium(station, peer))
+			continue;
+
+		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+			struct frame *queued;
+
+			list_for_each_entry(queued, &peer->queues[ac].frames, list) {
+				if (queued == skip)
+					continue;
+				if (!queued->attempt_scheduled)
+					continue;
+				if (timespec_to_usec(&queued->ppdu_end) <= base_us)
+					continue;
+
+				(*out)[idx].start = queued->ppdu_start;
+				(*out)[idx].end = queued->ppdu_end;
+				idx++;
+			}
+		}
+	}
+
+	qsort(*out, idx, sizeof(**out), medium_interval_cmp);
+	return idx;
+}
+
+/*
+ * 沿着同一 medium 中已预约的数据忙时段扫描，仿真 DCF 在信道忙时
+ * 冻结退避计数器、空闲后等待 DIFS 再继续倒计时的行为。
+ */
+static struct timespec find_backoff_completion_time(struct wmediumd *ctx,
+						    struct station *station,
+						    struct frame *frame,
+						    const struct timespec *base_time,
+						    int difs_us, int slot_time_us,
+						    int backoff_slots)
+{
+	struct medium_interval *intervals = NULL;
+	size_t count;
+	u64 cursor_us = timespec_to_usec(base_time);
+	u64 backoff_us = (u64)backoff_slots * slot_time_us;
+	bool need_difs = true;
+	size_t i;
+
+	count = collect_medium_intervals(ctx, station, frame, base_time, &intervals);
+	for (i = 0; i < count; i++) {
+		u64 start_us = timespec_to_usec(&intervals[i].start);
+		u64 end_us = timespec_to_usec(&intervals[i].end);
+		u64 idle_us;
+
+		if (end_us <= cursor_us)
+			continue;
+
+		if (start_us <= cursor_us) {
+			cursor_us = end_us;
+			need_difs = true;
+			continue;
+		}
+
+		idle_us = start_us - cursor_us;
+		if (need_difs) {
+			if (idle_us < (u64)difs_us) {
+				cursor_us = end_us;
+				continue;
+			}
+
+			cursor_us += difs_us;
+			idle_us -= difs_us;
+			need_difs = false;
+		}
+
+		if (backoff_us <= idle_us) {
+			cursor_us += backoff_us;
+			goto out;
+		}
+
+		backoff_us -= (idle_us / slot_time_us) * slot_time_us;
+		cursor_us = end_us;
+		need_difs = true;
+	}
+
+	if (need_difs)
+		cursor_us += difs_us;
+	cursor_us += backoff_us;
+
+out:
+	free(intervals);
+	return timespec_from_usec(cursor_us);
+}
+
+static int random_backoff_slots(struct wmediumd *ctx, int cw)
+{
+	if (use_fixed_random_value(ctx))
+		return cw / 2;
+
+	return (int)(drand48() * (cw + 1));
+}
+
+static double draw_frame_choice(struct wmediumd *ctx, double fixed_choice)
+{
+	if (use_fixed_random_value(ctx))
+		return fixed_choice;
+
+	return drand48();
+}
+
+static void finalize_frame_tx_rates(struct frame *frame)
+{
+	int i;
+
+	for (i = 0; i < frame->tx_rates_count; i++) {
+		if (frame->tx_rates[i].idx < 0 || !frame->attempts_done[i]) {
+			frame->tx_rates[i].idx = -1;
+			frame->tx_rates[i].count = -1;
+			continue;
+		}
+
+		frame->tx_rates[i].count = frame->attempts_done[i];
+	}
+}
+
+static void shift_station_queued_frames(struct wmediumd *ctx, struct station *station,
+					struct frame *skip, struct timespec *base,
+					u64 delta_us)
+{
+	int ac;
+
+	if (!delta_us)
+		return;
+
+	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+		struct frame *queued;
+
+		list_for_each_entry(queued, &station->queues[ac].frames, list) {
+			if (queued == skip)
+				continue;
+			if (!queued->attempt_scheduled)
+				continue;
+			if (timespec_before(&queued->ppdu_start, base))
+				continue;
+
+			release_ppdu_for_receivers(ctx, queued->sender,
+						   &queued->ppdu_start,
+						   &queued->ppdu_end);
+			timespec_add_usec64(&queued->ppdu_start, delta_us);
+			timespec_add_usec64(&queued->ppdu_end, delta_us);
+			timespec_add_usec64(&queued->expires, delta_us);
+			reserve_ppdu_for_receivers(ctx, queued->sender,
+						   &queued->ppdu_start,
+						   &queued->ppdu_end);
+		}
+	}
+}
+
+/*
+ * 成功发送后的 ACK/SIFS 是整个 medium 共享的忙时段。发送端自己的后续
+ * 队列已经串行化到 expires，无需再次平移；其余同一 medium 的未来帧
+ * 需要整体后移，避免把 ACK 窗口误当作空闲信道。
+ */
+static void shift_medium_queued_frames(struct wmediumd *ctx, struct frame *frame,
+				       struct timespec *base, u64 delta_us)
+{
+	struct station *station;
+	int ac;
+
+	if (!delta_us)
+		return;
+
+	list_for_each_entry(station, &ctx->stations, list) {
+		if (!same_medium(frame->sender, station))
+			continue;
+
+		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+			struct frame *queued;
+
+			list_for_each_entry(queued, &station->queues[ac].frames, list) {
+				if (queued == frame)
+					continue;
+				if (!queued->attempt_scheduled)
+					continue;
+				if (timespec_before(&queued->ppdu_start, base))
+					continue;
+				if (queued->sender == frame->sender &&
+				    !timespec_before(&queued->ppdu_start,
+						     &frame->expires))
+					continue;
+
+				release_ppdu_for_receivers(ctx, queued->sender,
+							   &queued->ppdu_start,
+							   &queued->ppdu_end);
+				timespec_add_usec64(&queued->ppdu_start, delta_us);
+				timespec_add_usec64(&queued->ppdu_end, delta_us);
+				timespec_add_usec64(&queued->expires, delta_us);
+				reserve_ppdu_for_receivers(ctx, queued->sender,
+							   &queued->ppdu_start,
+							   &queued->ppdu_end);
+			}
+		}
+	}
+}
+
+static int frame_has_more_attempts(struct frame *frame)
+{
+	int pos = frame->current_rate_pos;
+
+	while (pos < frame->tx_rates_count) {
+		if (frame->tx_rates[pos].idx < 0)
+			return 0;
+		if (frame->attempts_done[pos] < frame->tx_rates[pos].count)
+			return 1;
+		pos++;
+	}
+
+	return 0;
+}
+
+static void advance_frame_retry_state(struct frame *frame, struct wqueue *queue)
+{
+	frame->current_cw = (frame->current_cw << 1) + 1;
+	if (frame->current_cw > queue->cw_max)
+		frame->current_cw = queue->cw_max;
+
+	while (frame->current_rate_pos < frame->tx_rates_count) {
+		if (frame->tx_rates[frame->current_rate_pos].idx < 0)
+			return;
+		if (frame->attempts_done[frame->current_rate_pos] <
+		    frame->tx_rates[frame->current_rate_pos].count)
+			return;
+		frame->current_rate_pos++;
+	}
+}
+
+/*
+ * 为当前帧只安排“一次”物理层发送尝试。是否成功留到 attempt 到期时，
+ * 再根据届时的窗口重叠情况判定。
+ */
+static void schedule_frame_attempt(struct wmediumd *ctx, struct station *station,
+				   struct frame *frame,
+				   const struct timespec *base_time)
+{
+	int slot_time = 9;
+	int sifs = 16;
+	int difs = 2 * slot_time + sifs;
+	int rate_idx;
+	int airtime_us;
+	int access_delay_us;
+	int backoff_slots;
+	int signal_dbm = SNR_DEFAULT + NOISE_LEVEL;
+	struct station *deststa = NULL;
+	struct ieee80211_hdr *hdr = (void *)frame->data;
+
+	rate_idx = frame->tx_rates[frame->current_rate_pos].idx;
+	backoff_slots = random_backoff_slots(ctx, frame->current_cw);
+	airtime_us = pkt_duration(ctx, frame->data_len,
+				      index_to_rate(rate_idx, frame->freq));
+
+	frame->ppdu_start = find_backoff_completion_time(ctx, station, frame,
+							 base_time, difs,
+							 slot_time, backoff_slots);
+	access_delay_us = timespec_to_usec(&frame->ppdu_start) -
+			  timespec_to_usec(base_time);
+	frame->ppdu_end = timespec_plus_usec(&frame->ppdu_start, airtime_us);
+	frame->ppdu_airtime_us = airtime_us;
+	frame->final_rate_idx = rate_idx;
+	frame->signal = signal_dbm;
+	frame->expires = frame->ppdu_end;
+	if (!frame->noack)
+		timespec_add_usec64(&frame->expires, frame->ack_exchange_us);
+	frame->attempt_scheduled = true;
+
+	frame->service_time_us += access_delay_us + airtime_us;
+	if (!frame->noack)
+		frame->service_time_us += frame->ack_exchange_us;
+
+	if (!is_multicast_ether_addr(hdr->addr1))
+		deststa = get_station_by_addr(ctx, hdr->addr1);
+
+	if (deststa)
+		frame->signal = get_signal_dbm(ctx, station, deststa, true);
+
+	frame->attempts_done[frame->current_rate_pos]++;
+	reserve_ppdu_for_receivers(ctx, station, &frame->ppdu_start, &frame->ppdu_end);
+}
+
+static int __attribute__((unused)) set_interference_duration(struct wmediumd *ctx,
+				     int src_idx, int duration, int signal)
 {
 	int i, medium_id;
 
@@ -289,7 +983,7 @@ static int get_signal_offset_by_interference(struct wmediumd *ctx, int src_idx,
 	return (int)(milliwatt_to_dBm(intf_power) + 0.5);
 }
 
-bool is_multicast_ether_addr(const u8 *addr)
+static bool is_multicast_ether_addr(const u8 *addr)
 {
 	return 0x01 & addr[0];
 }
@@ -303,6 +997,23 @@ static struct station *get_station_by_addr(struct wmediumd *ctx, u8 *addr)
 			return station;
 	}
 	return NULL;
+}
+
+static int frame_delivery_rate_idx(struct frame *frame)
+{
+	int i;
+	int rate_idx = 0;
+
+	if (frame->final_rate_idx >= 0)
+		return frame->final_rate_idx;
+
+	for (i = 0; i < frame->tx_rates_count; i++) {
+		if (frame->tx_rates[i].idx < 0)
+			break;
+		rate_idx = frame->tx_rates[i].idx;
+	}
+
+	return rate_idx;
 }
 
 void detect_mediums(struct wmediumd *ctx, struct station *src, struct station *dest) {
@@ -343,144 +1054,61 @@ void queue_frame(struct wmediumd *ctx, struct station *station,
 	struct timespec now, target;
 	struct wqueue *queue;
 	struct frame *tail;
-	struct station *tmpsta, *deststa;
-	int send_time;
-	int cw;
-	double error_prob;
-	bool is_acked = false;
-	bool noack = false;
-	int i, j;
-	int rate_idx;
+	struct station *deststa;
 	int ac;
-
-	/* TODO configure phy parameters */
-	int slot_time = 9;
-	int sifs = 16;
-	int difs = 2 * slot_time + sifs;
-
-	int retries = 0;
+	int ack_airtime_us;
+	int i;
+	bool queue_was_empty;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 
-	int ack_time_usec = pkt_duration(ctx, 14, index_to_rate(0, frame->freq)) +
-			sifs;
-
-	/*
-	 * To determine a frame's expiration time, we compute the
-	 * number of retries we might have to make due to radio conditions
-	 * or contention, and add backoff time accordingly.  To that, we
-	 * add the expiration time of the previous frame in the queue.
-	 */
+	ack_airtime_us = pkt_duration(ctx, 14, index_to_rate(0, frame->freq));
 
 	ac = frame_select_queue_80211(frame);
 	queue = &station->queues[ac];
-
-	/* try to "send" this frame at each of the rates in the rateset */
-	send_time = 0;
-	cw = queue->cw_min;
-
-	int snr = SNR_DEFAULT;
+	queue_was_empty = list_empty(&queue->frames);
 
 	if (is_multicast_ether_addr(dest)) {
 		deststa = NULL;
 	} else {
 		deststa = get_station_by_addr(ctx, dest);
 		if (deststa) {
-            w_logf(ctx, LOG_DEBUG, "Packet from " MAC_FMT "(%d|%s) to " MAC_FMT "(%d|%s)\n",
-                   MAC_ARGS(station->addr), station->index, station->isap ? "AP" : "Sta",
-                   MAC_ARGS(deststa->addr), deststa->index, deststa->isap ? "AP" : "Sta");
-            detect_mediums(ctx,station,deststa);
-			snr = ctx->get_link_snr(ctx, station, deststa) -
-				get_signal_offset_by_interference(ctx,
-					station->index, deststa->index);
-			snr += ctx->get_fading_signal(ctx);
+			w_logf(ctx, LOG_DEBUG,
+			       "Packet from " MAC_FMT "(%d|%s) to " MAC_FMT "(%d|%s)\n",
+			       MAC_ARGS(station->addr), station->index,
+			       station->isap ? "AP" : "Sta",
+			       MAC_ARGS(deststa->addr), deststa->index,
+			       deststa->isap ? "AP" : "Sta");
+			detect_mediums(ctx, station, deststa);
 		}
 	}
-	frame->signal = snr + NOISE_LEVEL;
 
-	noack = frame_is_mgmt(frame) || is_multicast_ether_addr(dest);
-	double choice = -3.14;
-
-	if (use_fixed_random_value(ctx))
-		choice = drand48();
-
-	for (i = 0; i < frame->tx_rates_count && !is_acked; i++) {
-
-		rate_idx = frame->tx_rates[i].idx;
-
-		/* no more rates in MRR */
-		if (rate_idx < 0)
-			break;
-
-		error_prob = ctx->get_error_prob(ctx, snr, rate_idx,
-						 frame->freq, frame->data_len,
-						 station, deststa);
-		for (j = 0; j < frame->tx_rates[i].count; j++) {
-			send_time += difs + pkt_duration(ctx, frame->data_len,
-				index_to_rate(rate_idx, frame->freq));
-
-			retries++;
-
-			/* skip ack/backoff/retries for noack frames */
-			if (noack) {
-				is_acked = true;
-				break;
-			}
-
-			/* TODO TXOPs */
-
-			/* backoff */
-			if (j > 0) {
-				send_time += (cw * slot_time) / 2;
-				cw = (cw << 1) + 1;
-				if (cw > queue->cw_max)
-					cw = queue->cw_max;
-			}
-			if (!use_fixed_random_value(ctx))
-				choice = drand48();
-			if (choice > error_prob) {
-				is_acked = true;
-				break;
-			}
-			send_time += ack_time_usec;
-		}
-	}
-	if (is_acked) {
-		frame->tx_rates[i-1].count = j + 1;
-		for (; i < frame->tx_rates_count; i++) {
-			frame->tx_rates[i].idx = -1;
-			frame->tx_rates[i].count = -1;
-		}
-		frame->flags |= HWSIM_TX_STAT_ACK;
-	}
+	frame->queue_ac = ac;
+	frame->noack = frame_is_mgmt(frame) || is_multicast_ether_addr(dest);
+	frame->fixed_choice = use_fixed_random_value(ctx) ? drand48() : -1.0;
+	frame->flags &= ~HWSIM_TX_STAT_ACK;
+	frame->service_time_us = 0;
+	frame->ppdu_airtime_us = 0;
+	frame->final_rate_idx = -1;
+	frame->current_rate_pos = 0;
+	frame->current_cw = queue->cw_min;
+	frame->ack_exchange_us = 16 + ack_airtime_us;
+	memset(frame->attempts_done, 0, sizeof(frame->attempts_done));
+	clear_frame_schedule(frame);
 
 	/*
-	 * delivery time starts after any equal or higher prio frame
-	 * (or now, if none).
+	 * 若队列只是短暂见底，则沿用最近一次 medium 忙转闲时刻作为竞争
+	 * 基准，避免 paced 业务把不同站点的回退相位长期错开。
 	 */
-	target = now;
-    w_logf(ctx, LOG_DEBUG, "Sta " MAC_FMT " medium is #%d\n", MAC_ARGS(station->addr), station->medium_id);
-    list_for_each_entry(tmpsta, &ctx->stations, list) {
-        if (station->medium_id == tmpsta->medium_id) {
-            w_logf(ctx, LOG_DEBUG, "Sta " MAC_FMT " medium is also #%d\n", MAC_ARGS(tmpsta->addr),
-                   tmpsta->medium_id);
-            for (i = 0; i <= ac; i++) {
-                tail = list_last_entry_or_null(&tmpsta->queues[i].frames,
-                                               struct frame, list);
-                if (tail && timespec_before(&target, &tail->expires))
-                    target = tail->expires;
-            }
-        } else {
-            w_logf(ctx, LOG_DEBUG, "Sta " MAC_FMT " medium is not #%d, it is #%d\n", MAC_ARGS(tmpsta->addr),
-                   station->medium_id, tmpsta->medium_id);
-        }
-    }
-
-	timespec_add_usec(&target, send_time);
-
-	frame->duration = send_time;
-	frame->expires = target;
+	target = queue_was_empty ? recent_busy_sync_base(ctx, &now) : now;
 	list_add_tail(&frame->list, &queue->frames);
+	for (i = 0; i <= ac; i++) {
+		tail = queue_head_frame(&station->queues[i]);
+		if (tail && tail != frame && tail->attempt_scheduled &&
+		    timespec_before(&target, &tail->expires))
+			target = tail->expires;
+	}
+	schedule_queue_head_frame(ctx, station, ac, &target);
 	rearm_timer(ctx);
 }
 
@@ -544,7 +1172,8 @@ static int send_tx_info_frame(struct wmediumd *ctx, struct frame *frame)
 	int numBytes, ret;
 
 	if (is_ap){
-		numBytes = sendto(ctx->net_sock, frame, sizeof(*frame), 0, (struct sockaddr*)&clientAddr, len);
+		numBytes = sendto_retry(ctx->net_sock, frame, sizeof(*frame), 0,
+					 (struct sockaddr *)&clientAddr, len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to send xmit info to station: %s", strerror(errno));
 			ret = -1;
@@ -552,7 +1181,8 @@ static int send_tx_info_frame(struct wmediumd *ctx, struct frame *frame)
 		}
 	}
 	else{
-		numBytes = sendto(ctx->net_sock, frame, sizeof(*frame), 0, (struct sockaddr*)&serverAddr, len);
+		numBytes = sendto_retry(ctx->net_sock, frame, sizeof(*frame), 0,
+					 (struct sockaddr *)&serverAddr, len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to send xmit info to AP station: %s", strerror(errno));
 			ret = -1;
@@ -621,8 +1251,70 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 {
 	struct ieee80211_hdr *hdr = (void *) frame->data;
 	struct station *station;
+	struct station *deststa = NULL;
+	struct wqueue *queue = &frame->sender->queues[frame->queue_ac];
 	u8 *dest = hdr->addr1;
 	u8 *src = frame->sender->addr;
+	int rate_idx = frame_delivery_rate_idx(frame);
+	double error_prob = 0.0;
+	bool success = frame->noack;
+
+	if (!frame->noack && !is_multicast_ether_addr(dest))
+		deststa = get_station_by_addr(ctx, dest);
+
+	if (!frame->noack && deststa) {
+		if (rx_window_enabled(ctx)) {
+			error_prob = calc_rx_error_prob(ctx, frame->sender, deststa,
+							 &frame->ppdu_start,
+							 &frame->ppdu_end,
+							 frame->signal, rate_idx,
+							 frame->freq,
+							 frame->data_len, true);
+		} else {
+			int snr = ctx->get_link_snr(ctx, frame->sender, deststa) -
+				get_signal_offset_by_interference(ctx,
+					frame->sender->index, deststa->index);
+
+			snr += ctx->get_fading_signal(ctx);
+			frame->signal = snr + NOISE_LEVEL;
+			error_prob = ctx->get_error_prob(ctx, snr, rate_idx,
+							 frame->freq, frame->data_len,
+							 frame->sender, deststa);
+		}
+		success = draw_frame_choice(ctx, frame->fixed_choice) > error_prob;
+	}
+
+	release_ppdu_for_receivers(ctx, frame->sender,
+				   &frame->ppdu_start, &frame->ppdu_end);
+	frame->attempt_scheduled = false;
+
+	if (!success && !frame->noack) {
+		struct timespec retry_base = frame->expires;
+
+		if (timespec_before(&ctx->last_global_busy_end, &retry_base))
+			ctx->last_global_busy_end = retry_base;
+
+		advance_frame_retry_state(frame, queue);
+		if (frame_has_more_attempts(frame)) {
+			u64 extra_delay;
+
+			schedule_frame_attempt(ctx, frame->sender, frame, &retry_base);
+			extra_delay = timespec_to_usec(&frame->expires) -
+				      timespec_to_usec(&retry_base);
+			shift_station_queued_frames(ctx, frame->sender, frame,
+						    &retry_base, extra_delay);
+			list_add(&frame->list, &queue->frames);
+			rearm_timer(ctx);
+			return;
+		}
+	}
+
+	if (success)
+		frame->flags |= HWSIM_TX_STAT_ACK;
+
+	if (success && !frame->noack)
+		shift_medium_queued_frames(ctx, frame, &frame->ppdu_end,
+					   frame->ack_exchange_us);
 
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
 		/* rx the frame on the dest interface */
@@ -630,36 +1322,42 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 			if (memcmp(src, station->addr, ETH_ALEN) == 0)
 				continue;
 
-			int rate_idx;
 			if (is_multicast_ether_addr(dest)) {
 				int snr, signal;
-				double error_prob;
-				/*
-				 * we may or may not receive this based on
-				 * reverse link from sender -- check for
-				 * each receiver.
-				 */
-				snr = ctx->get_link_snr(ctx, frame->sender,
-							station);
+				double rx_error_prob;
+
+				snr = ctx->get_link_snr(ctx, frame->sender, station);
 				snr += ctx->get_fading_signal(ctx);
 				signal = snr + NOISE_LEVEL;
 				if (signal < CCA_THRESHOLD)
 					continue;
 
-				if (set_interference_duration(ctx,
-					frame->sender->index, frame->duration,
-					signal))
-					continue;
+				if (rx_window_enabled(ctx)) {
+					/*
+					 * medium_id 用于划分干扰域，不应阻断
+					 * 广播/组播控制帧的实际可达性。
+					 * 对目标接收端计算 SINR 时也需要扣除
+					 * 当前帧自身的信号功率。
+					 */
+					rx_error_prob = calc_rx_error_prob(ctx, frame->sender,
+									   station,
+									   &frame->ppdu_start,
+									   &frame->ppdu_end,
+									   signal, rate_idx,
+									   frame->freq,
+									   frame->data_len,
+									   true);
+				} else {
+					if (signal < CCA_THRESHOLD)
+						continue;
 
-				snr -= get_signal_offset_by_interference(ctx,
-					frame->sender->index, station->index);
-				rate_idx = frame->tx_rates[0].idx;
-				error_prob = ctx->get_error_prob(ctx,
-					(double)snr, rate_idx, frame->freq,
-					frame->data_len, frame->sender,
-					station);
+					rx_error_prob = ctx->get_error_prob(ctx,
+						(double)snr, rate_idx, frame->freq,
+						frame->data_len, frame->sender,
+						station);
+				}
 
-				if (drand48() <= error_prob) {
+				if (drand48() <= rx_error_prob) {
 					w_logf(ctx, LOG_INFO, "Dropped mcast from "
 						   MAC_FMT " to " MAC_FMT " at receiver\n",
 						   MAC_ARGS(src), MAC_ARGS(station->addr));
@@ -672,31 +1370,22 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 						      rate_idx, signal,
 						      frame->freq);
 			} else if (memcmp(dest, station->addr, ETH_ALEN) == 0) {
-				if (set_interference_duration(ctx,
-					frame->sender->index, frame->duration,
-					frame->signal))
-					continue;
-				// use the value that is last in list.
-				rate_idx = frame->tx_rates[0].idx;
-				for(int i = 0; i < frame->tx_rates_count; i++) {
-					if(frame->tx_rates[i].idx == -1) {
-						break;
-					}
-					rate_idx = frame->tx_rates[i].idx;
-				}
 				send_cloned_frame_msg(ctx, station,
 						      frame->data,
 						      frame->data_len,
 						      rate_idx, frame->signal,
 						      frame->freq);
-  			}
+			}
 		}
-	} else
-		set_interference_duration(ctx, frame->sender->index,
-					  frame->duration, frame->signal);
+	}
 
+	if (timespec_before(&ctx->last_global_busy_end, &frame->expires))
+		ctx->last_global_busy_end = frame->expires;
+
+	schedule_queue_head_frame(ctx, frame->sender, frame->queue_ac,
+				  &frame->expires);
+	finalize_frame_tx_rates(frame);
 	send_tx_info_frame(ctx, frame);
-
 	free(frame);
 }
 
@@ -716,13 +1405,35 @@ void deliver_expired_frames_queue(struct wmediumd *ctx,
 	}
 }
 
+static void process_station_queues(struct wmediumd *ctx, struct station *station,
+				   struct timespec *now)
+{
+	struct list_head *l;
+	int i;
+	int q_ct[IEEE80211_NUM_ACS] = {};
+
+	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+		list_for_each(l, &station->queues[i].frames)
+			q_ct[i]++;
+	}
+
+	w_logf(ctx, LOG_DEBUG, "[" TIME_FMT "] Station " MAC_FMT
+		       " BK %d BE %d VI %d VO %d\n",
+	       TIME_ARGS(now), MAC_ARGS(station->addr),
+	       q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
+	       q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
+
+	for (i = 0; i < IEEE80211_NUM_ACS; i++)
+		deliver_expired_frames_queue(ctx, &station->queues[i].frames, now);
+}
+
 void deliver_expired_frames(struct wmediumd *ctx)
 {
 	struct timespec now, _diff;
 	struct station *station;
-	struct list_head *l,*rand_it,*rand_start;
-    int i, j, duration;
-    int sta1_medium_id;
+	struct list_head *rand_it, *rand_start;
+	int i, j, duration;
+	int sta1_medium_id;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	
@@ -735,24 +1446,18 @@ void deliver_expired_frames(struct wmediumd *ctx)
 	}
 
 	list_for_each(rand_it, rand_start) {
-		//skip if we iterate over head
-		if(rand_it == &ctx->stations)
+		if (rand_it == &ctx->stations)
 			continue;
 		station = list_entry(rand_it, struct station, list);
-		int q_ct[IEEE80211_NUM_ACS] = {};
-		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-			list_for_each(l, &station->queues[i].frames) {
-				q_ct[i]++;
-			}
-		}
-		w_logf(ctx, LOG_DEBUG, "[" TIME_FMT "] Station " MAC_FMT
-					   " BK %d BE %d VI %d VO %d\n",
-			   TIME_ARGS(&now), MAC_ARGS(station->addr),
-			   q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
-			   q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
+		process_station_queues(ctx, station, &now);
+	}
 
-		for (i = 0; i < IEEE80211_NUM_ACS; i++)
-			deliver_expired_frames_queue(ctx, &station->queues[i].frames, &now);
+	for (rand_it = ctx->stations.next; rand_it != rand_start;
+	     rand_it = rand_it->next) {
+		if (rand_it == &ctx->stations)
+			continue;
+		station = list_entry(rand_it, struct station, list);
+		process_station_queues(ctx, station, &now);
 	}
 	w_logf(ctx, LOG_DEBUG, "\n\n");
 
@@ -928,7 +1633,8 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 	memcpy(out_buf, nlh, nlh->nlmsg_len);
 
 	if (is_ap){
-		numBytes = sendto(ctx->net_sock, out_buf, nlh->nlmsg_len, 0, (struct sockaddr*)&clientAddr, len);
+		numBytes = sendto_retry(ctx->net_sock, out_buf, nlh->nlmsg_len, 0,
+					 (struct sockaddr *)&clientAddr, len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to send data to station: %s", strerror(errno));
 			ret = -1;
@@ -936,7 +1642,8 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 		}
 	}
 	else{
-		numBytes = sendto(ctx->net_sock, out_buf, nlh->nlmsg_len, 0, (struct sockaddr*)&serverAddr, len);
+		numBytes = sendto_retry(ctx->net_sock, out_buf, nlh->nlmsg_len, 0,
+					 (struct sockaddr *)&serverAddr, len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to send data to AP station: %s", strerror(errno));
 			ret = -1;
@@ -998,16 +1705,22 @@ static void net_sock_event_cb(int fd, short what, void *data)
 	bzero(in_buf, PAGE_SIZE);
 
 	if (is_ap){
-		numBytes = recvfrom(fd, in_buf, PAGE_SIZE, 0, (struct sockaddr*)&clientAddr, &len);
+		numBytes = recvfrom_retry(fd, in_buf, PAGE_SIZE, 0,
+					  (struct sockaddr *)&clientAddr, &len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to receive data from station: %s", strerror(errno));
+			return;
+		} else if (numBytes == 0) {
 			return;
 		}
 	}
 	else{
-		numBytes = recvfrom(fd, in_buf, PAGE_SIZE, 0, (struct sockaddr*)&serverAddr, &len);
+		numBytes = recvfrom_retry(fd, in_buf, PAGE_SIZE, 0,
+					  (struct sockaddr *)&serverAddr, &len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to receive data from AP station: %s", strerror(errno));
+			return;
+		} else if (numBytes == 0) {
 			return;
 		}
 	}
@@ -1087,6 +1800,7 @@ int init_remote_connection(struct wmediumd* ctx, char* ap_ipaddr)
 		ret = -1;
 		goto out;
 	}
+	configure_best_effort_socket(ctx->net_sock);
     
 	bzero(&serverAddr, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
@@ -1104,7 +1818,8 @@ int init_remote_connection(struct wmediumd* ctx, char* ap_ipaddr)
 		w_logf(ctx, LOG_INFO, "Waiting for station machine to connect\n");
 		
 		/* Wait until station machine connects. This is primarily meant to get the client details */
-		numBytes = recvfrom(ctx->net_sock, in_buf, 5, 0, (struct sockaddr*)&clientAddr, &len);
+		numBytes = recvfrom_retry(ctx->net_sock, in_buf, 5, 0,
+					  (struct sockaddr *)&clientAddr, &len);
         if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to receive initiate command from client: %s\n", strerror(errno));
 			ret = -1;
@@ -1124,7 +1839,10 @@ int init_remote_connection(struct wmediumd* ctx, char* ap_ipaddr)
 		
 		/* The client must send a message first for the server to know the client address details */
 		const char* initiate_comm = "start";
-		numBytes = sendto(ctx->net_sock, initiate_comm, strlen(initiate_comm), 0, (const struct sockaddr*)&serverAddr, len);
+		numBytes = sendto_retry(ctx->net_sock, initiate_comm,
+						strlen(initiate_comm), 0,
+						(const struct sockaddr *)&serverAddr,
+						len);
 		if (numBytes < 0){
 			w_flogf(ctx, LOG_ERR, stderr, "Failed to send initiate message: %s\n", strerror(errno));
 			ret = -1;
@@ -1172,11 +1890,28 @@ static void timer_cb(int fd, short what, void *data)
 	uint64_t u;
 
 	pthread_rwlock_rdlock(&snr_lock);
-	read(fd, &u, sizeof(u));
+	if (read(fd, &u, sizeof(u)) < 0) {
+		pthread_rwlock_unlock(&snr_lock);
+		return;
+	}
 	ctx->move_stations(ctx);
 	deliver_expired_frames(ctx);
 	rearm_timer(ctx);
 	pthread_rwlock_unlock(&snr_lock);
+}
+
+static void free_all_stations(struct wmediumd *ctx)
+{
+	struct station *station, *tmp;
+
+	list_for_each_entry_safe(station, tmp, &ctx->stations, list) {
+		list_del(&station->list);
+		station_free_resources(station);
+		free(station);
+	}
+
+	free(ctx->sta_array);
+	ctx->sta_array = NULL;
 }
 
 int main(int argc, char *argv[])
@@ -1307,6 +2042,8 @@ int main(int argc, char *argv[])
 	ctx.timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
 	clock_gettime(CLOCK_MONOTONIC, &ctx.intf_updated);
 	clock_gettime(CLOCK_MONOTONIC, &ctx.next_move);
+	ctx.last_global_busy_end.tv_sec = 0;
+	ctx.last_global_busy_end.tv_nsec = 0;
 	ctx.next_move.tv_sec += MOVE_INTERVAL;
 	event_set(&ev_timer, ctx.timerfd, EV_READ | EV_PERSIST, timer_cb, &ctx);
 	event_add(&ev_timer, NULL);
@@ -1329,6 +2066,7 @@ int main(int argc, char *argv[])
 	free(ctx.cb);
 	free(ctx.intf);
 	free(ctx.per_matrix);
+	free_all_stations(&ctx);
 
 	return EXIT_SUCCESS;
 }

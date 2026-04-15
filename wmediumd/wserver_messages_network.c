@@ -20,6 +20,7 @@
 
 #include <netinet/in.h>
 #include <errno.h>
+#include <unistd.h>
 #include "wserver_messages_network.h"
 
 
@@ -27,14 +28,22 @@ int sendfull(int sock, const void *buf, size_t len, size_t shift, int flags) {
     size_t total = 0;
     size_t bytesleft = len;
     ssize_t currsent = 0;
+    const char *base = buf;
     while (total < len) {
-        currsent = send(sock, buf + shift + total, bytesleft, flags);
+        currsent = send(sock, base + shift + total, bytesleft, flags);
         if (currsent == -1) {
-            if (errno == EPIPE || errno == ECONNRESET) {
+            if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            } else if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN) {
                 return WACTION_DISCONNECTED;
             } else {
                 return -errno;
             }
+        } else if (currsent == 0) {
+            return WACTION_DISCONNECTED;
         }
         total += currsent;
         bytesleft -= currsent;
@@ -46,10 +55,16 @@ int recvfull(int sock, void *buf, size_t len, size_t shift, int flags) {
     size_t total = 0;
     size_t bytesleft = len;
     ssize_t currrecv = 0;
+    char *base = buf;
     while (total < len) {
-        currrecv = recv(sock, buf + shift + total, bytesleft, flags);
+        currrecv = recv(sock, base + shift + total, bytesleft, flags);
         if (currrecv == -1) {
-            if (errno == EPIPE || errno == ECONNRESET) {
+            if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            } else if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN) {
                 return WACTION_DISCONNECTED;
             } else {
                 return -errno;

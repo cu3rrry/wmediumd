@@ -75,7 +75,7 @@ static struct rate rateset_GI_20[] = {
 	{ .mbps = 1170, .mqam = 64, .fec = FEC_RATE_3_4 },
 	{ .mbps = 1300, .mqam = 64, .fec = FEC_RATE_4_5 },
 };
-static size_t rate_len_GI_20 = ARRAY_SIZE(rateset_GI_20);
+static size_t __attribute__((unused)) rate_len_GI_20 = ARRAY_SIZE(rateset_GI_20);
 
 static struct rate rateset_SGI_20[] = {
 	/*
@@ -99,7 +99,7 @@ static struct rate rateset_SGI_20[] = {
 	{ .mbps = 1303, .mqam = 64, .fec = FEC_RATE_3_4 },
 	{ .mbps = 1444, .mqam = 64, .fec = FEC_RATE_5_6 },
 };
-static size_t rate_len_SGI_20 = ARRAY_SIZE(rateset_SGI_20);
+static size_t __attribute__((unused)) rate_len_SGI_20 = ARRAY_SIZE(rateset_SGI_20);
 
 static struct rate rateset_GI_40[] = {
 	/*
@@ -123,7 +123,7 @@ static struct rate rateset_GI_40[] = {
 	{ .mbps = 2430, .mqam = 64, .fec = FEC_RATE_3_4 },
 	{ .mbps = 2700, .mqam = 64, .fec = FEC_RATE_5_6 },
 };
-static size_t rate_len_GI_40 = ARRAY_SIZE(rateset_GI_40);
+static size_t __attribute__((unused)) rate_len_GI_40 = ARRAY_SIZE(rateset_GI_40);
 
 static struct rate rateset_SGI_40[] = {
 	/*
@@ -147,7 +147,7 @@ static struct rate rateset_SGI_40[] = {
 	{ .mbps = 2700, .mqam = 64, .fec = FEC_RATE_3_4 },
 	{ .mbps = 3000, .mqam = 64, .fec = FEC_RATE_5_6 },
 };
-static size_t rate_len_SGI_40 = ARRAY_SIZE(rateset_SGI_40);
+static size_t __attribute__((unused)) rate_len_SGI_40 = ARRAY_SIZE(rateset_SGI_40);
 
 static double n_choose_k(double n, double k)
 {
@@ -261,31 +261,57 @@ static double per(double ber, enum fec_rate rate, int frame_len)
 	return 1.0 - pow(1 - prob_uncorrected, 8 * frame_len);
 }
 
-double get_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq,
-							   int frame_len)
+static int get_rate_params(unsigned int *rate_idx, u32 freq, int *m,
+			   enum fec_rate *fec)
+{
+	if (freq > 5000)
+		*rate_idx += 4;
+
+	if (*rate_idx >= rate_len)
+		return -1;
+
+	*m = rateset[*rate_idx].mqam;
+	if (fec)
+		*fec = rateset[*rate_idx].fec;
+
+	return 0;
+}
+
+double get_bit_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq)
 {
 	int m;
-	enum fec_rate fec;
-	double ber;
 
 	if (snr <= 0.0)
 		return 1.0;
 
-	if (freq > 5000)
-		    rate_idx += 4;
-
-	if (rate_idx >= rate_len)
+	if (get_rate_params(&rate_idx, freq, &m, NULL) < 0)
 		return 1.0;
 
-	m = rateset[rate_idx].mqam;
-	fec = rateset[rate_idx].fec;
-
 	if (m == 2)
-		ber = bpsk_ber(snr);
-	else
-		ber = mqam_ber(m, snr);
+		return bpsk_ber(snr);
+
+	return mqam_ber(m, snr);
+}
+
+double get_error_prob_from_ber(double ber, unsigned int rate_idx, u32 freq,
+			       int frame_len)
+{
+	int m;
+	enum fec_rate fec;
+
+	if (get_rate_params(&rate_idx, freq, &m, &fec) < 0)
+		return 1.0;
 
 	return per(ber, fec, frame_len);
+}
+
+double get_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq,
+								   int frame_len)
+{
+	double ber;
+
+	ber = get_bit_error_prob_from_snr(snr, rate_idx, freq);
+	return get_error_prob_from_ber(ber, rate_idx, freq, frame_len);
 }
 
 static double get_error_prob_from_per_matrix(struct wmediumd *ctx, double snr,
