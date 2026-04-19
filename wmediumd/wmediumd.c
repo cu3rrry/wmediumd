@@ -183,6 +183,33 @@ static struct timespec timespec_from_usec(u64 usec)
 	return out;
 }
 
+static u64 interpolate_u64(int value, int start, int end,
+			   u64 start_val, u64 end_val)
+{
+	u64 span;
+	u64 delta;
+
+	if (start >= end || value <= start)
+		return start_val;
+	if (value >= end)
+		return end_val;
+
+	span = (u64)(end - start);
+	delta = (u64)(value - start);
+	if (end_val >= start_val)
+		return start_val + ((end_val - start_val) * delta) / span;
+
+	return start_val - ((start_val - end_val) * delta) / span;
+}
+
+static unsigned int interpolate_pct(int value, int start, int end,
+				    unsigned int start_pct,
+				    unsigned int end_pct)
+{
+	return (unsigned int)interpolate_u64(value, start, end,
+					     start_pct, end_pct);
+}
+
 static struct timespec timespec_forever(void)
 {
 	struct timespec out;
@@ -234,7 +261,10 @@ static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
 	struct timespec now_copy = *now;
 	u64 now_us;
 	u64 busy_end_us;
+	u64 gap_us;
 	u64 sync_grace_us;
+	u64 adjusted_gap_us;
+	unsigned int pull_pct;
 
 	if (ctx->enable_medium_detection)
 		return *now;
@@ -245,12 +275,61 @@ static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
 
 	now_us = timespec_to_usec(now);
 	busy_end_us = timespec_to_usec(&ctx->last_global_busy_end);
-	sync_grace_us = ctx->num_stas <= LOW_NODE_SYNC_MAX_STAS ?
-		LOW_NODE_QUEUE_SYNC_GRACE_US : QUEUE_SYNC_GRACE_US;
-	if (now_us - busy_end_us <= sync_grace_us)
-		return ctx->last_global_busy_end;
+	gap_us = now_us - busy_end_us;
 
-	return *now;
+	if (ctx->num_stas <= QUEUE_SYNC_RELAXED_STAS) {
+		sync_grace_us = interpolate_u64(ctx->num_stas,
+						CONTENTION_CURVE_MIN_STAS,
+						QUEUE_SYNC_RELAXED_STAS,
+						QUEUE_SYNC_GRACE_US,
+						RELAXED_NODE_QUEUE_SYNC_GRACE_US);
+		pull_pct = interpolate_pct(ctx->num_stas,
+					   CONTENTION_CURVE_MIN_STAS,
+					   QUEUE_SYNC_RELAXED_STAS,
+					   QUEUE_SYNC_PULL_BASE_PCT,
+					   QUEUE_SYNC_PULL_RELAXED_PCT);
+	} else if (ctx->num_stas <= QUEUE_SYNC_FULL_STAS) {
+		sync_grace_us = interpolate_u64(ctx->num_stas,
+						QUEUE_SYNC_RELAXED_STAS,
+						QUEUE_SYNC_FULL_STAS,
+						RELAXED_NODE_QUEUE_SYNC_GRACE_US,
+						LOW_NODE_QUEUE_SYNC_GRACE_US);
+		pull_pct = interpolate_pct(ctx->num_stas,
+					   QUEUE_SYNC_RELAXED_STAS,
+					   QUEUE_SYNC_FULL_STAS,
+					   QUEUE_SYNC_PULL_RELAXED_PCT,
+					   QUEUE_SYNC_PULL_FULL_PCT);
+	} else if (ctx->num_stas <= MID_NODE_RX_WINDOW_MAX_STAS) {
+		sync_grace_us = LOW_NODE_QUEUE_SYNC_GRACE_US;
+		pull_pct = QUEUE_SYNC_PULL_FULL_PCT;
+	} else if (ctx->num_stas <= QUEUE_SYNC_TAIL_STAS) {
+		sync_grace_us = interpolate_u64(ctx->num_stas,
+						MID_NODE_RX_WINDOW_MAX_STAS,
+						QUEUE_SYNC_TAIL_STAS,
+						LOW_NODE_QUEUE_SYNC_GRACE_US,
+						HIGH_NODE_QUEUE_SYNC_GRACE_US);
+		pull_pct = interpolate_pct(ctx->num_stas,
+					   MID_NODE_RX_WINDOW_MAX_STAS,
+					   QUEUE_SYNC_TAIL_STAS,
+					   QUEUE_SYNC_PULL_FULL_PCT,
+					   QUEUE_SYNC_PULL_HIGH_PCT);
+	} else {
+		sync_grace_us = HIGH_NODE_QUEUE_SYNC_GRACE_US;
+		pull_pct = QUEUE_SYNC_PULL_HIGH_PCT;
+	}
+
+	if (gap_us > sync_grace_us || !pull_pct)
+		return *now;
+
+	/*
+	 * 不再用“命中阈值就完全回拉”的硬切换，而是让回拉强度随着
+	 * 空窗长度逐步衰减。短空窗更接近上一轮 busy 结束时刻，
+	 * 较长空窗则逐渐回到本地入队时间。
+	 */
+	pull_pct = (unsigned int)(((u64)pull_pct * (sync_grace_us - gap_us)) /
+				  sync_grace_us);
+	adjusted_gap_us = (gap_us * (100U - pull_pct)) / 100U;
+	return timespec_plus_usec(&ctx->last_global_busy_end, adjusted_gap_us);
 }
 
 static void schedule_queue_head_frame(struct wmediumd *ctx,
@@ -439,6 +518,12 @@ static u64 rx_window_guard_us(struct wmediumd *ctx)
 		return RX_WINDOW_GUARD_LOW_US;
 	if (ctx->num_stas <= MID_NODE_RX_WINDOW_MAX_STAS)
 		return RX_WINDOW_GUARD_MID_US;
+	if (ctx->num_stas <= RX_WINDOW_GUARD_TAIL_STAS)
+		return interpolate_u64(ctx->num_stas,
+				       MID_NODE_RX_WINDOW_MAX_STAS,
+				       RX_WINDOW_GUARD_TAIL_STAS,
+				       RX_WINDOW_GUARD_MID_US,
+				       RX_WINDOW_GUARD_HIGH_US);
 
 	return RX_WINDOW_GUARD_HIGH_US;
 }

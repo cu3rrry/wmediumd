@@ -148,23 +148,32 @@ typedef uint64_t u64;
  */
 #define RX_WINDOW_SLOTS		(65536)
 /*
- * paced 上层流量会让发送队列在低中节点区间短暂见底，随后不同站点以
- * 微小相位差重新入队，碰撞概率被明显低估。若 medium 刚刚忙转闲，就
- * 把这些“短空窗”视作仍处于同一轮饱和竞争中。
+ * paced 上层流量会让发送队列在短空窗后重新入队。为避免硬阈值切换带来
+ * 的两头失真，这里只在 3/6 节点附近放松 queue re-sync，9..30 节点保留
+ * 当前版本已经验证有效的强同步，42 节点后再逐步回落，避免尾段被误伤。
  */
 #define QUEUE_SYNC_GRACE_US	(500)
+#define CONTENTION_CURVE_MIN_STAS	(3)
+#define QUEUE_SYNC_RELAXED_STAS		(6)
+#define QUEUE_SYNC_FULL_STAS		(9)
+#define QUEUE_SYNC_TAIL_STAS		(42)
+#define RELAXED_NODE_QUEUE_SYNC_GRACE_US	(6000)
 #define LOW_NODE_QUEUE_SYNC_GRACE_US	(2500000)
-#define LOW_NODE_SYNC_MAX_STAS	(30)
+#define HIGH_NODE_QUEUE_SYNC_GRACE_US	(5000)
+#define QUEUE_SYNC_PULL_BASE_PCT	(30)
+#define QUEUE_SYNC_PULL_RELAXED_PCT	(45)
+#define QUEUE_SYNC_PULL_FULL_PCT	(100)
+#define QUEUE_SYNC_PULL_HIGH_PCT	(50)
 /*
- * 接收端循环窗口不能只记录“净 PPDU”时长。对低节点饱和上行，
- * 如果把相邻上行序列之间几十微秒的恢复/检测空隙直接视作干净空闲，
- * 会把本应互相耦合的发送波次拆散，吞吐量被系统性抬高。
+ * 接收端循环窗口保持当前 `<=12` / `13..30` 的稳定 guard 档位，只在
+ * `30+` 区间改成平滑回落，避免 30 附近因为硬切换出现额外断层。
  */
-#define RX_WINDOW_GUARD_HIGH_US	(20)
-#define RX_WINDOW_GUARD_LOW_US	(96)
-#define RX_WINDOW_GUARD_MID_US	(160)
+#define RX_WINDOW_GUARD_LOW_US		(96)
+#define RX_WINDOW_GUARD_MID_US		(160)
+#define RX_WINDOW_GUARD_HIGH_US		(20)
 #define LOW_NODE_RX_WINDOW_MAX_STAS	(12)
 #define MID_NODE_RX_WINDOW_MAX_STAS	(30)
+#define RX_WINDOW_GUARD_TAIL_STAS	(42)
 
 enum En_OperationMode
 {
