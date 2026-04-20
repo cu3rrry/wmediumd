@@ -165,6 +165,15 @@ typedef uint64_t u64;
 #define QUEUE_SYNC_PULL_FULL_PCT	(100)
 #define QUEUE_SYNC_PULL_HIGH_PCT	(50)
 /*
+ * 6..24 节点的 queue-empty 重入里，完全回拉到最近 busy 结束时刻会抹掉
+ * 原始入队时差，使 9..18 节点段过度同步。这里只在该区间轻量削弱回拉强度，
+ * 让短空窗重入保留一小部分本地 gap，不改调度主流程，也尽量不碰 24+ 尾段。
+ */
+#define TARGET_REENTRY_MIN_STAS			(6)
+#define TARGET_REENTRY_PEAK_STAS		(18)
+#define TARGET_REENTRY_MAX_STAS			(33)
+#define TARGET_REENTRY_PULL_REDUCTION_PEAK_PCT	(80)
+/*
  * 接收端循环窗口保持当前 `<=12` / `13..30` 的稳定 guard 档位，只在
  * `30+` 区间改成平滑回落，避免 30 附近因为硬切换出现额外断层。
  */
@@ -174,7 +183,6 @@ typedef uint64_t u64;
 #define LOW_NODE_RX_WINDOW_MAX_STAS	(12)
 #define MID_NODE_RX_WINDOW_MAX_STAS	(30)
 #define RX_WINDOW_GUARD_TAIL_STAS	(42)
-
 enum En_OperationMode
 {
 	LOCAL,

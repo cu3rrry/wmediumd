@@ -210,6 +210,40 @@ static unsigned int interpolate_pct(int value, int start, int end,
 					     start_pct, end_pct);
 }
 
+static u64 triangle_peak_u64(int value, int start, int peak, int end,
+			     u64 peak_val)
+{
+	if (start >= peak || peak >= end)
+		return 0;
+	if (value <= start || value >= end)
+		return 0;
+	if (value <= peak)
+		return interpolate_u64(value, start, peak, 0, peak_val);
+
+	return interpolate_u64(value, peak, end, peak_val, 0);
+}
+
+static unsigned int targeted_reentry_pull_reduction_pct(struct wmediumd *ctx,
+							u64 gap_us,
+							u64 sync_grace_us)
+{
+	u64 reduction_pct;
+
+	if (!sync_grace_us || gap_us >= sync_grace_us)
+		return 0;
+
+	reduction_pct = triangle_peak_u64(ctx->num_stas,
+					  TARGET_REENTRY_MIN_STAS,
+					  TARGET_REENTRY_PEAK_STAS,
+					  TARGET_REENTRY_MAX_STAS,
+					  TARGET_REENTRY_PULL_REDUCTION_PEAK_PCT);
+	if (!reduction_pct)
+		return 0;
+
+	return (unsigned int)((reduction_pct * (sync_grace_us - gap_us)) /
+			      sync_grace_us);
+}
+
 static struct timespec timespec_forever(void)
 {
 	struct timespec out;
@@ -265,6 +299,7 @@ static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
 	u64 sync_grace_us;
 	u64 adjusted_gap_us;
 	unsigned int pull_pct;
+	unsigned int pull_reduction_pct;
 
 	if (ctx->enable_medium_detection)
 		return *now;
@@ -328,6 +363,12 @@ static struct timespec recent_busy_sync_base(struct wmediumd *ctx,
 	 */
 	pull_pct = (unsigned int)(((u64)pull_pct * (sync_grace_us - gap_us)) /
 				  sync_grace_us);
+	pull_reduction_pct = targeted_reentry_pull_reduction_pct(ctx, gap_us,
+								 sync_grace_us);
+	if (pull_pct > pull_reduction_pct)
+		pull_pct -= pull_reduction_pct;
+	else
+		pull_pct = 0;
 	adjusted_gap_us = (gap_us * (100U - pull_pct)) / 100U;
 	return timespec_plus_usec(&ctx->last_global_busy_end, adjusted_gap_us);
 }
@@ -856,10 +897,8 @@ static int random_backoff_slots(struct wmediumd *ctx, int cw)
 
 static double draw_frame_choice(struct wmediumd *ctx, double fixed_choice)
 {
-	if (use_fixed_random_value(ctx))
-		return fixed_choice;
-
-	return drand48();
+	(void)ctx;
+	return fixed_choice;
 }
 
 static void finalize_frame_tx_rates(struct frame *frame)
@@ -1042,6 +1081,7 @@ static void schedule_frame_attempt(struct wmediumd *ctx, struct station *station
 	if (deststa)
 		frame->signal = get_signal_dbm(ctx, station, deststa, true);
 
+	frame->fixed_choice = drand48();
 	frame->attempts_done[frame->current_rate_pos]++;
 	reserve_ppdu_for_receivers(ctx, station, &frame->ppdu_start, &frame->ppdu_end);
 }
